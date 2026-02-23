@@ -1,7 +1,8 @@
 // FairScale Telegram Verification Bot
-// Production-ready, secure, battle-tested
+// Production-ready with wallet ownership verification
 
 import TelegramBot from 'node-telegram-bot-api';
+import { Connection, PublicKey } from '@solana/web3.js';
 import 'dotenv/config';
 
 // =============================================================================
@@ -16,13 +17,27 @@ const CONFIG = {
   FAIRSCALE_API: process.env.FAIRSCALE_API || 'https://api.fairscale.xyz',
   FAIRSCALE_API_KEY: process.env.FAIRSCALE_API_KEY,
   
+  // Verification
+  TREASURY_WALLET: process.env.TREASURY_WALLET || 'fairAUEuR1SCcHL254Vb3F3XpUWLruJ2a11f6QfANEN',
+  VERIFICATION_AMOUNT_SOL: 0.001, // 0.001 SOL to verify ownership
+  VERIFICATION_AMOUNT_LAMPORTS: 1000000, // 0.001 SOL in lamports
+  
+  // Solana
+  SOLANA_RPC: process.env.SOLANA_RPC || 'https://api.mainnet-beta.solana.com',
+  
   // Defaults
   DEFAULT_MIN_SCORE: 60,
   
   // Rate limiting
   VERIFY_COOLDOWN_MS: 60 * 1000,
   MAX_ATTEMPTS_PER_HOUR: 5,
+  
+  // Verification timeout
+  VERIFICATION_TIMEOUT_MS: 10 * 60 * 1000, // 10 minutes to complete verification
 };
+
+// Initialize Solana connection
+const solana = new Connection(CONFIG.SOLANA_RPC, 'confirmed');
 
 // =============================================================================
 // STORAGE (Replace with database in production)
@@ -40,11 +55,14 @@ const rateLimits = new Map();
 // Wallet registry: `${chatId}-${wallet}` -> { userId }
 const walletRegistry = new Map();
 
-// Pending verifications: `${chatId}-${userId}` -> { state, timestamp }
+// Pending verifications: `${chatId}-${userId}` -> { state, wallet, timestamp, verificationCode }
 const pendingVerifications = new Map();
 
 // Admin cache: chatId -> Set of admin userIds
 const adminCache = new Map();
+
+// Processed transactions (prevent replay)
+const processedTxs = new Set();
 
 // =============================================================================
 // HELPERS
@@ -52,8 +70,12 @@ const adminCache = new Map();
 
 function isValidSolanaAddress(address) {
   if (!address || typeof address !== 'string') return false;
-  const base58Regex = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
-  return base58Regex.test(address);
+  try {
+    new PublicKey(address);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function checkRateLimit(chatId, userId) {
@@ -113,19 +135,74 @@ async function getFairScore(wallet) {
   }
 }
 
+async function verifyWalletPayment(wallet) {
+  try {
+    const walletPubkey = new PublicKey(wallet);
+    const treasuryPubkey = new PublicKey(CONFIG.TREASURY_WALLET);
+    
+    // Get recent transactions for the wallet
+    const signatures = await solana.getSignaturesForAddress(walletPubkey, { limit: 10 });
+    
+    for (const sigInfo of signatures) {
+      // Skip if already processed
+      if (processedTxs.has(sigInfo.signature)) continue;
+      
+      // Skip if older than verification timeout
+      if (sigInfo.blockTime && Date.now() - sigInfo.blockTime * 1000 > CONFIG.VERIFICATION_TIMEOUT_MS) {
+        continue;
+      }
+      
+      // Get transaction details
+      const tx = await solana.getTransaction(sigInfo.signature, {
+        commitment: 'confirmed',
+        maxSupportedTransactionVersion: 0,
+      });
+      
+      if (!tx || tx.meta?.err) continue;
+      
+      // Check if it's a transfer to our treasury
+      const preBalances = tx.meta.preBalances;
+      const postBalances = tx.meta.postBalances;
+      const accountKeys = tx.transaction.message.staticAccountKeys || tx.transaction.message.accountKeys;
+      
+      for (let i = 0; i < accountKeys.length; i++) {
+        const account = accountKeys[i].toString();
+        
+        if (account === CONFIG.TREASURY_WALLET) {
+          const received = postBalances[i] - preBalances[i];
+          
+          if (received >= CONFIG.VERIFICATION_AMOUNT_LAMPORTS) {
+            // Verify sender is the wallet claiming ownership
+            const senderIndex = tx.transaction.message.staticAccountKeys ? 0 : 0;
+            const sender = accountKeys[senderIndex].toString();
+            
+            if (sender === wallet) {
+              // Mark as processed
+              processedTxs.add(sigInfo.signature);
+              return { verified: true, signature: sigInfo.signature };
+            }
+          }
+        }
+      }
+    }
+    
+    return { verified: false };
+  } catch (error) {
+    console.error('Verification error:', error);
+    return { verified: false, error: error.message };
+  }
+}
+
 async function isAdmin(bot, chatId, userId) {
   try {
-    // Check cache first
     if (adminCache.has(chatId)) {
       return adminCache.get(chatId).has(userId);
     }
     
-    // Fetch admins
     const admins = await bot.getChatAdministrators(chatId);
     const adminSet = new Set(admins.map(a => a.user.id));
     adminCache.set(chatId, adminSet);
     
-    // Clear cache after 5 minutes
     setTimeout(() => adminCache.delete(chatId), 5 * 60 * 1000);
     
     return adminSet.has(userId);
@@ -137,35 +214,17 @@ async function isAdmin(bot, chatId, userId) {
 
 function formatScore(data, passed, minScore) {
   const status = passed ? '✅ VERIFIED' : '❌ NOT VERIFIED';
-  const tierEmoji = {
-    'platinum': '💎',
-    'gold': '🥇',
-    'silver': '🥈',
-    'bronze': '🥉',
-  };
   
   let message = `*FairScale Verification*\n\n`;
   message += `${status}\n\n`;
-  message += `*FairScore:* ${data.fairscore}/100 ${tierEmoji[data.tier] || ''}\n`;
-  message += `*Tier:* ${data.tier || 'Unknown'}\n`;
+  message += `*FairScore:* ${data.fairscore}/100\n`;
   message += `*Required:* ${minScore}+\n`;
-  
-  if (data.badges && data.badges.length > 0) {
-    message += `\n*Badges:*\n`;
-    data.badges.slice(0, 5).forEach(b => {
-      message += `• ${b.name}\n`;
-    });
-  }
   
   if (!passed) {
     message += `\n_You need a score of ${minScore} or higher to verify._`;
   }
   
   return message;
-}
-
-function escapeMarkdown(text) {
-  return text.replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
 }
 
 // =============================================================================
@@ -192,18 +251,19 @@ bot.onText(/\/start/, async (msg) => {
     message += `/check <wallet> - Check any wallet's score\n`;
     message += `/mystatus - View your verification\n\n`;
     message += `*Admin Commands:*\n`;
-    message += `/setup <score> - Set minimum score (e.g. /setup 60)\n`;
+    message += `/setup <score> - Set minimum score\n`;
+    message += `/restrict - Toggle restrict mode (block unverified users)\n`;
     message += `/settings - View current settings\n`;
-    message += `/unverify @user - Remove verification`;
+    message += `/unverify - Remove user verification (reply to user)`;
   } else {
     message = `*⚖️ FairScale Verification Bot*\n\n`;
     message += `Add me to a group to enable wallet-based verification.\n\n`;
     message += `*How it works:*\n`;
     message += `1. Add bot to your group\n`;
-    message += `2. Make bot admin (to restrict users)\n`;
+    message += `2. Make bot admin\n`;
     message += `3. Use /setup to set minimum score\n`;
-    message += `4. Users verify with /verify\n\n`;
-    message += `[Add to Group](https://t.me/${(await bot.getMe()).username}?startgroup=true)`;
+    message += `4. Use /restrict to block unverified users\n`;
+    message += `5. Users verify with /verify`;
   }
   
   bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
@@ -239,15 +299,120 @@ bot.onText(/\/verify/, async (msg) => {
     return bot.sendMessage(chatId, `⏳ ${rateCheck.reason}`, { reply_to_message_id: msg.message_id });
   }
   
-  // Set pending state
-  pendingVerifications.set(verifyKey, { state: 'awaiting_wallet', timestamp: Date.now() });
+  // Set pending state - awaiting wallet
+  pendingVerifications.set(verifyKey, { 
+    state: 'awaiting_wallet', 
+    timestamp: Date.now() 
+  });
   
-  // Ask for wallet
   bot.sendMessage(
     chatId,
-    `Please reply with your Solana wallet address to verify.`,
+    `*Step 1/2:* Please reply with your Solana wallet address.`,
+    { parse_mode: 'Markdown', reply_to_message_id: msg.message_id }
+  );
+});
+
+// =============================================================================
+// COMMAND: /confirm
+// =============================================================================
+
+bot.onText(/\/confirm/, async (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const verifyKey = `${chatId}-${userId}`;
+  
+  const pending = pendingVerifications.get(verifyKey);
+  
+  if (!pending || pending.state !== 'awaiting_payment') {
+    return bot.sendMessage(
+      chatId,
+      '❌ No pending verification. Use /verify to start.',
+      { reply_to_message_id: msg.message_id }
+    );
+  }
+  
+  // Check timeout
+  if (Date.now() - pending.timestamp > CONFIG.VERIFICATION_TIMEOUT_MS) {
+    pendingVerifications.delete(verifyKey);
+    return bot.sendMessage(
+      chatId,
+      '❌ Verification expired. Please start again with /verify.',
+      { reply_to_message_id: msg.message_id }
+    );
+  }
+  
+  const loadingMsg = await bot.sendMessage(
+    chatId,
+    '⏳ Checking for payment...',
     { reply_to_message_id: msg.message_id }
   );
+  
+  // Verify payment from wallet
+  const verification = await verifyWalletPayment(pending.wallet);
+  
+  if (!verification.verified) {
+    return bot.editMessageText(
+      `❌ Payment not found.\n\nMake sure you sent *exactly ${CONFIG.VERIFICATION_AMOUNT_SOL} SOL* from:\n\`${pending.wallet}\`\n\nTo:\n\`${CONFIG.TREASURY_WALLET}\`\n\nThen try /confirm again.`,
+      { 
+        chat_id: chatId, 
+        message_id: loadingMsg.message_id,
+        parse_mode: 'Markdown'
+      }
+    );
+  }
+  
+  // Payment verified - now check FairScore
+  recordAttempt(chatId, userId);
+  
+  const settings = groupSettings.get(chatId) || { minScore: CONFIG.DEFAULT_MIN_SCORE };
+  const data = await getFairScore(pending.wallet);
+  
+  if (!data || data.fairscore === undefined) {
+    pendingVerifications.delete(verifyKey);
+    return bot.editMessageText(
+      '❌ Failed to fetch wallet score. Please try again later.',
+      { chat_id: chatId, message_id: loadingMsg.message_id }
+    );
+  }
+  
+  const passed = data.fairscore >= settings.minScore;
+  
+  if (passed) {
+    // Store verification
+    verifiedUsers.set(verifyKey, {
+      wallet: pending.wallet,
+      score: data.fairscore,
+      verifiedAt: new Date().toISOString(),
+      txSignature: verification.signature,
+    });
+    walletRegistry.set(`${chatId}-${pending.wallet}`, { userId });
+    
+    // Unrestrict user
+    try {
+      await bot.restrictChatMember(chatId, userId, {
+        can_send_messages: true,
+        can_send_media_messages: true,
+        can_send_polls: true,
+        can_send_other_messages: true,
+        can_add_web_page_previews: true,
+        can_change_info: false,
+        can_invite_users: true,
+        can_pin_messages: false,
+      });
+    } catch (error) {
+      // Bot may not have permission
+    }
+  }
+  
+  pendingVerifications.delete(verifyKey);
+  
+  const message = formatScore(data, passed, settings.minScore);
+  
+  bot.editMessageText(message, {
+    chat_id: chatId,
+    message_id: loadingMsg.message_id,
+    parse_mode: 'Markdown',
+  });
 });
 
 // =============================================================================
@@ -259,24 +424,21 @@ bot.on('message', async (msg) => {
   const userId = msg.from.id;
   const text = msg.text;
   
-  // Skip commands
   if (!text || text.startsWith('/')) return;
   
-  // Check if user has pending verification
   const verifyKey = `${chatId}-${userId}`;
   const pending = pendingVerifications.get(verifyKey);
   
   if (!pending || pending.state !== 'awaiting_wallet') return;
   
-  // Check timeout (5 minutes)
-  if (Date.now() - pending.timestamp > 5 * 60 * 1000) {
+  // Check timeout
+  if (Date.now() - pending.timestamp > CONFIG.VERIFICATION_TIMEOUT_MS) {
     pendingVerifications.delete(verifyKey);
     return;
   }
   
   const wallet = text.trim();
   
-  // Validate wallet
   if (!isValidSolanaAddress(wallet)) {
     return bot.sendMessage(
       chatId,
@@ -296,59 +458,24 @@ bot.on('message', async (msg) => {
     );
   }
   
-  // Record attempt
-  recordAttempt(chatId, userId);
-  pendingVerifications.delete(verifyKey);
+  // Update state to awaiting payment
+  pendingVerifications.set(verifyKey, {
+    state: 'awaiting_payment',
+    wallet: wallet,
+    timestamp: Date.now(),
+  });
   
-  // Send loading message
-  const loadingMsg = await bot.sendMessage(chatId, '⏳ Checking wallet...', { reply_to_message_id: msg.message_id });
+  const message = `*Step 2/2: Verify Wallet Ownership*\n\n` +
+    `Send *exactly ${CONFIG.VERIFICATION_AMOUNT_SOL} SOL* from:\n` +
+    `\`${wallet}\`\n\n` +
+    `To:\n` +
+    `\`${CONFIG.TREASURY_WALLET}\`\n\n` +
+    `Once sent, reply with /confirm\n\n` +
+    `_This proves you own this wallet. You have 10 minutes._`;
   
-  // Get settings
-  const settings = groupSettings.get(chatId) || { minScore: CONFIG.DEFAULT_MIN_SCORE };
-  
-  // Fetch FairScore
-  const data = await getFairScore(wallet);
-  
-  if (!data || data.fairscore === undefined) {
-    return bot.editMessageText(
-      '❌ Failed to fetch wallet score. Please try again later.',
-      { chat_id: chatId, message_id: loadingMsg.message_id }
-    );
-  }
-  
-  const passed = data.fairscore >= settings.minScore;
-  const message = formatScore(data, passed, settings.minScore);
-  
-  if (passed) {
-    // Store verification
-    verifiedUsers.set(verifyKey, {
-      wallet,
-      score: data.fairscore,
-      verifiedAt: new Date().toISOString(),
-    });
-    walletRegistry.set(walletKey, { userId });
-    
-    // Unrestrict user if they were restricted
-    try {
-      await bot.restrictChatMember(chatId, userId, {
-        can_send_messages: true,
-        can_send_media_messages: true,
-        can_send_polls: true,
-        can_send_other_messages: true,
-        can_add_web_page_previews: true,
-        can_change_info: false,
-        can_invite_users: true,
-        can_pin_messages: false,
-      });
-    } catch (error) {
-      // Bot may not have permission, that's ok
-    }
-  }
-  
-  bot.editMessageText(message, {
-    chat_id: chatId,
-    message_id: loadingMsg.message_id,
-    parse_mode: 'Markdown',
+  bot.sendMessage(chatId, message, { 
+    parse_mode: 'Markdown', 
+    reply_to_message_id: msg.message_id 
   });
 });
 
@@ -379,24 +506,9 @@ bot.onText(/\/check(?:\s+(.+))?/, async (msg, match) => {
     );
   }
   
-  const tierEmoji = {
-    'platinum': '💎',
-    'gold': '🥇',
-    'silver': '🥈',
-    'bronze': '🥉',
-  };
-  
   let message = `*⚖️ FairScale Wallet Check*\n\n`;
   message += `*Wallet:* \`${wallet.slice(0, 8)}...${wallet.slice(-6)}\`\n`;
-  message += `*FairScore:* ${data.fairscore}/100 ${tierEmoji[data.tier] || ''}\n`;
-  message += `*Tier:* ${data.tier || 'Unknown'}\n`;
-  
-  if (data.badges && data.badges.length > 0) {
-    message += `\n*Badges:*\n`;
-    data.badges.slice(0, 5).forEach(b => {
-      message += `• ${b.name}\n`;
-    });
-  }
+  message += `*FairScore:* ${data.fairscore}/100\n`;
   
   bot.editMessageText(message, {
     chat_id: chatId,
@@ -446,7 +558,6 @@ bot.onText(/\/setup(?:\s+(\d+))?/, async (msg, match) => {
     return bot.sendMessage(chatId, '❌ This command only works in groups.');
   }
   
-  // Check admin
   if (!await isAdmin(bot, chatId, userId)) {
     return bot.sendMessage(chatId, '❌ Only admins can use this command.', { reply_to_message_id: msg.message_id });
   }
@@ -455,15 +566,44 @@ bot.onText(/\/setup(?:\s+(\d+))?/, async (msg, match) => {
     return bot.sendMessage(chatId, 'Usage: /setup <score>\nExample: /setup 60', { reply_to_message_id: msg.message_id });
   }
   
-  const settings = groupSettings.get(chatId) || { minScore: CONFIG.DEFAULT_MIN_SCORE };
+  const settings = groupSettings.get(chatId) || { minScore: CONFIG.DEFAULT_MIN_SCORE, restrictNewUsers: false };
   settings.minScore = minScore;
   groupSettings.set(chatId, settings);
   
   bot.sendMessage(
     chatId,
-    `✅ Settings updated!\n\nMinimum FairScore: ${minScore}`,
+    `✅ Minimum FairScore set to ${minScore}`,
     { reply_to_message_id: msg.message_id }
   );
+});
+
+// =============================================================================
+// COMMAND: /restrict (Admin)
+// =============================================================================
+
+bot.onText(/\/restrict/, async (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  
+  const isGroup = msg.chat.type === 'group' || msg.chat.type === 'supergroup';
+  if (!isGroup) {
+    return bot.sendMessage(chatId, '❌ This command only works in groups.');
+  }
+  
+  if (!await isAdmin(bot, chatId, userId)) {
+    return bot.sendMessage(chatId, '❌ Only admins can use this command.', { reply_to_message_id: msg.message_id });
+  }
+  
+  const settings = groupSettings.get(chatId) || { minScore: CONFIG.DEFAULT_MIN_SCORE, restrictNewUsers: false };
+  settings.restrictNewUsers = !settings.restrictNewUsers;
+  groupSettings.set(chatId, settings);
+  
+  const status = settings.restrictNewUsers ? 'ON' : 'OFF';
+  const message = settings.restrictNewUsers 
+    ? `🔒 Restrict mode *ON*\n\nNew members will be muted until they verify with /verify.`
+    : `🔓 Restrict mode *OFF*\n\nNew members can message without verification.`;
+  
+  bot.sendMessage(chatId, message, { parse_mode: 'Markdown', reply_to_message_id: msg.message_id });
 });
 
 // =============================================================================
@@ -483,12 +623,16 @@ bot.onText(/\/settings/, async (msg) => {
     return bot.sendMessage(chatId, '❌ Only admins can use this command.', { reply_to_message_id: msg.message_id });
   }
   
-  const settings = groupSettings.get(chatId) || { minScore: CONFIG.DEFAULT_MIN_SCORE };
+  const settings = groupSettings.get(chatId) || { minScore: CONFIG.DEFAULT_MIN_SCORE, restrictNewUsers: false };
   const verifiedCount = Array.from(verifiedUsers.keys()).filter(k => k.startsWith(`${chatId}-`)).length;
+  
+  const restrictStatus = settings.restrictNewUsers ? '🔒 ON' : '🔓 OFF';
   
   const message = `*⚖️ FairScale Settings*\n\n` +
     `*Minimum Score:* ${settings.minScore}\n` +
-    `*Verified Users:* ${verifiedCount}`;
+    `*Restrict Mode:* ${restrictStatus}\n` +
+    `*Verified Users:* ${verifiedCount}\n` +
+    `*Verification Fee:* ${CONFIG.VERIFICATION_AMOUNT_SOL} SOL`;
   
   bot.sendMessage(chatId, message, { parse_mode: 'Markdown', reply_to_message_id: msg.message_id });
 });
@@ -510,7 +654,6 @@ bot.onText(/\/unverify/, async (msg) => {
     return bot.sendMessage(chatId, '❌ Only admins can use this command.', { reply_to_message_id: msg.message_id });
   }
   
-  // Check if replying to a user
   if (!msg.reply_to_message) {
     return bot.sendMessage(
       chatId,
@@ -528,22 +671,39 @@ bot.onText(/\/unverify/, async (msg) => {
     return bot.sendMessage(chatId, `❌ ${targetUsername} is not verified.`, { reply_to_message_id: msg.message_id });
   }
   
-  // Remove verification
   verifiedUsers.delete(verifyKey);
   walletRegistry.delete(`${chatId}-${verification.wallet}`);
+  
+  // Re-restrict user if restrict mode is on
+  const settings = groupSettings.get(chatId);
+  if (settings?.restrictNewUsers) {
+    try {
+      await bot.restrictChatMember(chatId, targetUserId, {
+        can_send_messages: false,
+        can_send_media_messages: false,
+        can_send_polls: false,
+        can_send_other_messages: false,
+        can_add_web_page_previews: false,
+        can_change_info: false,
+        can_invite_users: false,
+        can_pin_messages: false,
+      });
+    } catch (error) {
+      // Bot may not have permission
+    }
+  }
   
   bot.sendMessage(chatId, `✅ Removed verification from ${targetUsername}.`, { reply_to_message_id: msg.message_id });
 });
 
 // =============================================================================
-// NEW MEMBER HANDLING (Optional: Restrict until verified)
+// NEW MEMBER HANDLING
 // =============================================================================
 
 bot.on('new_chat_members', async (msg) => {
   const chatId = msg.chat.id;
   const settings = groupSettings.get(chatId);
   
-  // Only restrict if settings exist and restrictNewUsers is enabled
   if (!settings?.restrictNewUsers) return;
   
   for (const member of msg.new_chat_members) {
@@ -563,7 +723,7 @@ bot.on('new_chat_members', async (msg) => {
       
       bot.sendMessage(
         chatId,
-        `Welcome ${member.first_name}! Please use /verify with your Solana wallet to gain access.`
+        `Welcome ${member.first_name}! 👋\n\nThis group requires wallet verification.\n\nUse /verify to get started.`
       );
     } catch (error) {
       console.error('Failed to restrict new member:', error);
@@ -587,13 +747,19 @@ console.log(`
 ║            FairScale Telegram Verification Bot                     ║
 ╠════════════════════════════════════════════════════════════════════╣
 ║  Status:    Online                                                 ║
+║  Treasury:  ${CONFIG.TREASURY_WALLET}  ║
+║  Fee:       ${CONFIG.VERIFICATION_AMOUNT_SOL} SOL                                              ║
 ║                                                                    ║
-║  Commands:                                                         ║
+║  User Commands:                                                    ║
 ║    /verify          Start verification                             ║
+║    /confirm         Confirm payment sent                           ║
 ║    /check <wallet>  Check any wallet's score                       ║
 ║    /mystatus        View your verification                         ║
-║    /setup <score>   Set minimum score (Admin)                      ║
-║    /settings        View settings (Admin)                          ║
-║    /unverify        Remove verification (Admin)                    ║
+║                                                                    ║
+║  Admin Commands:                                                   ║
+║    /setup <score>   Set minimum score                              ║
+║    /restrict        Toggle restrict mode                           ║
+║    /settings        View settings                                  ║
+║    /unverify        Remove verification (reply to user)            ║
 ╚════════════════════════════════════════════════════════════════════╝
 `);
